@@ -7,4 +7,5 @@
 /recordings
 /data
 /.vscode
-/_pycache_
+/__pycache__
+/v4
