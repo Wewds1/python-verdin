@@ -1,0 +1,10 @@
+.env
+/build
+/venv
+*.pt
+/whatsapp_notif
+*.db
+/recordings
+/data
+/.vscode
+/_pycache_

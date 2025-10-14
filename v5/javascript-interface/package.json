@@ -1,0 +1,16 @@
+{
+  "name": "cctv-javascript-interface",
+  "version": "1.0.0",
+  "description": "JavaScript interface for CCTV Python system",
+  "main": "cctvController.js",
+  "scripts": {
+    "test": "node test.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "keywords": ["cctv", "motion-detection", "security"],
+  "author": "Your Name",
+  "license": "MIT"
+}
