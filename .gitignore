@@ -8,5 +8,6 @@
 /data
 /.vscode
 /__pycache__
+/v4/dist
+/v4/build
 /v4
-/dist
