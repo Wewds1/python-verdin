@@ -1,0 +1,42 @@
+{
+  "motion_detection": {
+    "threshold": 75,
+    "min_area": 3000,
+    "blur_kernel": 21,
+    "cooldown_seconds": 5,
+    "use_gaussian_blur": true,
+    "use_morphology": true
+  },
+  "yolo_detection": {
+    "enabled": true,
+    "model_path": "yolo11n.pt",
+    "confidence_threshold": 0.5,
+    "classes_to_detect": [
+      0,
+      1,
+      2,
+      3,
+      5,
+      7
+    ],
+    "overlap_threshold": 0.3
+  },
+  "notifications": {
+    "enabled": true,
+    "cooldown_seconds": 30,
+    "include_screenshot": true,
+    "include_video": false,
+    "video_duration": 10
+  },
+  "system": {
+    "view_resolution": [
+      1280,
+      720
+    ],
+    "api_port": 5001,
+    "api_host": "0.0.0.0",
+    "auto_start_api": true,
+    "log_level": "INFO"
+  },
+  "cameras": {}
+}

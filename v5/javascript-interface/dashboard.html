@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CCTV Control Dashboard</title>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+        }
+        .control-group {
+            background: #f9f9f9;
+            padding: 15px;
+            border-radius: 6px;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button.danger {
+            background: #dc3545;
+        }
+        button.danger:hover {
+            background: #c82333;
+        }
+        button.success {
+            background: #28a745;
+        }
+        button.success:hover {
+            background: #218838;
+        }
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        .status-indicator.online {
+            background: #28a745;
+        }
+        .status-indicator.offline {
+            background: #dc3545;
+        }
+        .log {
+            background: #000;
+            color: #0f0;
+            padding: 15px;
+            border-radius: 6px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 14px;
+        }
+        .alert {
+            background: #ff6b6b;
+            color: white;
+            padding: 15px;
+            border-radius: 6px;
+            margin: 10px 0;
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        input, select {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            margin: 5px;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+        }
+        .stat-item {
+            text-align: center;
+            padding: 15px;
+            background: #e9ecef;
+            border-radius: 6px;
+        }
+        .stat-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #007bff;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎥 CCTV Control Dashboard</h1>
+        
+        <!-- Status Section -->
+        <div class="card">
+            <h2>System Status</h2>
+            <div class="stats">
+                <div class="stat-item">
+                    <div class="stat-value" id="api-status">❓</div>
+                    <div>Control API</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="websocket-status">❓</div>
+                    <div>WebSocket</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="camera-count">0</div>
+                    <div>Active Cameras</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="notification-count">0</div>
+                    <div>Notifications</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Controls Section -->
+        <div class="card">
+            <h2>Controls</h2>
+            <div class="controls">
+                <div class="control-group">
+                    <h3>YOLO Detection</h3>
+                    <button id="yolo-enable" class="success">Enable YOLO</button>
+                    <button id="yolo-disable" class="danger">Disable YOLO</button>
+                    <div id="yolo-status">Status: Unknown</div>
+                </div>
+
+                <div class="control-group">
+                    <h3>Notifications</h3>
+                    <button id="notify-enable" class="success">Enable Notifications</button>
+                    <button id="notify-disable" class="danger">Disable Notifications</button>
+                    <div id="notify-status">Status: Unknown</div>
+                </div>
+
+                <div class="control-group">
+                    <h3>View Resolution</h3>
+                    <select id="resolution-preset">
+                        <option value="640,480">640x480</option>
+                        <option value="800,600">800x600</option>
+                        <option value="1024,768">1024x768</option>
+                        <option value="1280,720" selected>1280x720</option>
+                        <option value="1920,1080">1920x1080</option>
+                    </select>
+                    <button id="set-resolution">Set Resolution</button>
+                    <div id="resolution-status">Current: Unknown</div>
+                </div>
+
+                <div class="control-group">
+                    <h3>System</h3>
+                    <button id="refresh-status">Refresh Status</button>
+                    <button id="test-connection">Test Connection</button>
+                    <button id="clear-log">Clear Log</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Real-time Alerts -->
+        <div class="card">
+            <h2>🚨 Real-Time Alerts</h2>
+            <div id="alerts-container">
+                <p>Waiting for motion alerts...</p>
+            </div>
+        </div>
+
+        <!-- Activity Log -->
+        <div class="card">
+            <h2>Activity Log</h2>
+            <div id="activity-log" class="log">Connecting to CCTV system...</div>
+        </div>
+    </div>
+
+    <script>
+        class CCTVDashboard {
+            constructor() {
+                this.controlApiUrl = 'http://localhost:5001';
+                this.webhookServerUrl = 'http://139.177.195.237:3000';
+                this.socket = null;
+                this.notificationCount = 0;
+                
+                this.init();
+            }
+
+            async init() {
+                this.setupEventListeners();
+                await this.connectWebSocket();
+                await this.refreshStatus();
+                
+                // Auto-refresh status every 30 seconds
+                setInterval(() => this.refreshStatus(), 30000);
+            }
+
+            setupEventListeners() {
+                // YOLO controls
+                document.getElementById('yolo-enable').onclick = () => this.setYolo(true);
+                document.getElementById('yolo-disable').onclick = () => this.setYolo(false);
+
+                // Notification controls
+                document.getElementById('notify-enable').onclick = () => this.setNotifications(true);
+                document.getElementById('notify-disable').onclick = () => this.setNotifications(false);
+
+                // Resolution control
+                document.getElementById('set-resolution').onclick = () => this.setResolution();
+
+                // System controls
+                document.getElementById('refresh-status').onclick = () => this.refreshStatus();
+                document.getElementById('test-connection').onclick = () => this.testConnection();
+                document.getElementById('clear-log').onclick = () => this.clearLog();
+            }
+
+            async connectWebSocket() {
+                try {
+                    this.socket = io(this.webhookServerUrl, {
+                        transports: ['websocket', 'polling'],
+                        timeout: 20000
+                    });
+
+                    this.socket.on('connect', () => {
+                        this.log('✅ WebSocket connected');
+                        this.updateStatus('websocket-status', '🟢');
+                    });
+
+                    this.socket.on('disconnect', () => {
+                        this.log('❌ WebSocket disconnected');
+                        this.updateStatus('websocket-status', '🔴');
+                    });
+
+                    this.socket.on('motionAlert', (data) => {
+                        this.handleMotionAlert(data);
+                    });
+
+                    this.socket.on('welcome', (data) => {
+                        this.log(`👋 ${data.message}`);
+                    });
+
+                } catch (error) {
+                    this.log(`❌ WebSocket error: ${error.message}`);
+                }
+            }
+
+            async refreshStatus() {
+                try {
+                    const response = await fetch(`${this.controlApiUrl}/status`);
+                    const status = await response.json();
+                    
+                    this.updateStatus('api-status', '🟢');
+                    this.updateStatus('camera-count', status.cameras.length);
+                    
+                    document.getElementById('yolo-status').textContent = 
+                        `Status: ${status.yolo_filtering ? 'Enabled' : 'Disabled'}`;
+                    document.getElementById('notify-status').textContent = 
+                        `Status: ${status.notifications_enabled ? 'Enabled' : 'Disabled'}`;
+                    document.getElementById('resolution-status').textContent = 
+                        `Current: ${status.view_resolution[0]}x${status.view_resolution[1]}`;
+                    
+                    this.log(`📊 Status updated - Cameras: ${status.cameras.length}, YOLO: ${status.yolo_filtering ? 'ON' : 'OFF'}`);
+                    
+                } catch (error) {
+                    this.updateStatus('api-status', '🔴');
+                    this.log(`❌ Failed to get status: ${error.message}`);
+                }
+            }
+
+            async setYolo(enabled) {
+                try {
+                    const response = await fetch(`${this.controlApiUrl}/settings/yolo`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ enabled })
+                    });
+                    
+                    if (response.ok) {
+                        this.log(`✅ YOLO filtering ${enabled ? 'enabled' : 'disabled'}`);
+                        await this.refreshStatus();
+                    } else {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                } catch (error) {
+                    this.log(`❌ Failed to set YOLO: ${error.message}`);
+                }
+            }
+
+            async setNotifications(enabled) {
+                try {
+                    const response = await fetch(`${this.controlApiUrl}/settings/notifications`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ enabled })
+                    });
+                    
+                    if (response.ok) {
+                        this.log(`✅ Notifications ${enabled ? 'enabled' : 'disabled'}`);
+                        await this.refreshStatus();
+                    } else {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                } catch (error) {
+                    this.log(`❌ Failed to set notifications: ${error.message}`);
+                }
+            }
+
+            async setResolution() {
+                try {
+                    const preset = document.getElementById('resolution-preset').value;
+                    const [width, height] = preset.split(',').map(x => parseInt(x));
+                    
+                    const response = await fetch(`${this.controlApiUrl}/settings/view`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ width, height })
+                    });
+                    
+                    if (response.ok) {
+                        this.log(`✅ Resolution set to ${width}x${height}`);
+                        await this.refreshStatus();
+                    } else {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                } catch (error) {
+                    this.log(`❌ Failed to set resolution: ${error.message}`);
+                }
+            }
+
+            async testConnection() {
+                this.log('🔍 Testing connections...');
+                
+                // Test API
+                try {
+                    const response = await fetch(`${this.controlApiUrl}/health`);
+                    if (response.ok) {
+                        this.log('✅ Control API connection OK');
+                    } else {
+                        this.log('❌ Control API connection failed');
+                    }
+                } catch (error) {
+                    this.log('❌ Control API unreachable');
+                }
+
+                // Test WebSocket
+                if (this.socket && this.socket.connected) {
+                    this.log('✅ WebSocket connection OK');
+                } else {
+                    this.log('❌ WebSocket connection failed');
+                }
+            }
+
+            handleMotionAlert(data) {
+                this.notificationCount++;
+                this.updateStatus('notification-count', this.notificationCount);
+                
+                // Add to alerts container
+                const alertsContainer = document.getElementById('alerts-container');
+                const alertElement = document.createElement('div');
+                alertElement.className = 'alert';
+                alertElement.innerHTML = `
+                    <strong>🚨 Motion Detected!</strong><br>
+                    📹 Camera: ${data.camera_name}<br>
+                    📍 ROI: ${data.roi_name}<br>
+                    ⏰ Time: ${new Date(data.timestamp).toLocaleString()}<br>
+                    📸 Screenshot: ${data.has_screenshot ? 'Yes' : 'No'}<br>
+                    🎥 Video: ${data.has_video ? 'Yes' : 'No'}
+                `;
+                
+                alertsContainer.insertBefore(alertElement, alertsContainer.firstChild);
+                
+                // Remove old alerts (keep last 5)
+                while (alertsContainer.children.length > 6) {
+                    alertsContainer.removeChild(alertsContainer.lastChild);
+                }
+                
+                this.log(`🚨 MOTION: ${data.camera_name}/${data.roi_name} at ${new Date(data.timestamp).toLocaleTimeString()}`);
+            }
+
+            updateStatus(elementId, value) {
+                document.getElementById(elementId).textContent = value;
+            }
+
+            log(message) {
+                const logElement = document.getElementById('activity-log');
+                const timestamp = new Date().toLocaleTimeString();
+                logElement.innerHTML += `<div>[${timestamp}] ${message}</div>`;
+                logElement.scrollTop = logElement.scrollHeight;
+            }
+
+            clearLog() {
+                document.getElementById('activity-log').innerHTML = '';
+                document.getElementById('alerts-container').innerHTML = '<p>Waiting for motion alerts...</p>';
+                this.notificationCount = 0;
+                this.updateStatus('notification-count', 0);
+            }
+        }
+
+        // Initialize dashboard when page loads
+        window.addEventListener('load', () => {
+            new CCTVDashboard();
+        });
+    </script>
+</body>
+</html>

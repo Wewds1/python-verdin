@@ -3,545 +3,388 @@ import numpy as np
 import os
 import time
 import threading
-import datetime
-import imutils
-import subprocess
-from sender import WhatsAppNotifier
-from config import WHATSAPP_CONFIG
+from datetime import datetime
+from pathlib import Path
+from notifier import WebhookNotifier
 
 class MotionDetector:
-    def __init__(self, acceleration_manager, save_path='recordings/', save_screenshots=True, save_videos=True, video_duration=10):
+    def __init__(self, acceleration_manager):
         self.acceleration_manager = acceleration_manager
-        self.subtract_images = acceleration_manager.get_subtract_function()
-        self.use_cuda = acceleration_manager.cuda_available
-        self.use_opencl = acceleration_manager.opencl_available
-
-        # Recording Settings
-        self.save_path = save_path
-        self.save_screenshots = save_screenshots
-        self.save_videos = save_videos
-        self.video_duration = video_duration
-
-        # Recording Directories
-        self.screenshot_dir = os.path.join(save_path, 'screenshots')
-        self.video_path = os.path.join(save_path, 'videos')
-        self.temp_video_dir = os.path.join(save_path, 'temp_videos')
-        os.makedirs(self.screenshot_dir, exist_ok=True)
-        os.makedirs(self.video_path, exist_ok=True)
-        os.makedirs(self.temp_video_dir, exist_ok=True)
-
-        # Video Recording State
-        self.active_recordings = {}
-        self.recording_timers = {}
-        self.last_detection_time = {}
-
-        # WhatsApp Notifier 
-        self.whatsapp_enabled = WHATSAPP_CONFIG.get('enabled', False)
-        if self.whatsapp_enabled:
-            self.whatsapp = WhatsAppNotifier(
-                access_token=WHATSAPP_CONFIG['access_token'],
-                phone_number_id=WHATSAPP_CONFIG['phone_number_id']
-            )
-            self.recipient_number = WHATSAPP_CONFIG['recipient_number']
-        else:
-            self.whatsapp = None
-
-        # Motion consistency tracking
-        self.roi_motion_start_times = {}
-        self.roi_last_screenshot_time = {}
-        self.roi_last_whatsapp_time = {}
-        self.screenshot_cooldown = 5.0
-        self.whatsapp_cooldown = 10.0
-        self.motion_consistency_duration = 1.0
+        self.cuda_available = acceleration_manager.cuda_available
+        self.recordings_dir = Path("recordings")
+        self.screenshots_dir = self.recordings_dir / "screenshots"
+        self.temp_videos_dir = self.recordings_dir / "temp_videos"
+        self.videos_dir = self.recordings_dir / "videos"
         
-    def initialize_gpu_memory(self, height=720, width=1280):
-        if not self.use_cuda:
-            return False, {}
+        # Create directories
+        for dir_path in [self.screenshots_dir, self.temp_videos_dir, self.videos_dir]:
+            dir_path.mkdir(parents=True, exist_ok=True)
+        
+        self.notifier = WebhookNotifier()
+        self.active_recordings = {}
+        self.recording_lock = threading.Lock()
+        
+        # Motion detection settings
+        self.motion_threshold = 2000  # Minimum contour area to consider as motion
+        self.notification_cooldown = 30  # Seconds between notifications for same ROI
+        self.last_notification_time = {}  # Track last notification per ROI
+        
+        # NEW: API Control flags
+        self.notifications_enabled = True
+        
+    # NEW: API Control method
+    def set_notifications_enabled(self, enabled: bool):
+        """Enable/disable notifications via API"""
+        self.notifications_enabled = bool(enabled)
+        print(f"Motion notifications: {'ENABLED' if self.notifications_enabled else 'DISABLED'}")
+        
+    def initialize_gpu_memory(self):
+        """Initialize GPU memory for CUDA operations"""
+        if not self.cuda_available:
+            return False, None
             
         try:
             gpu_objects = {
-                'gpu_frame': cv2.cuda_GpuMat(height, width, cv2.CV_8UC3),
-                'gpu_gray': cv2.cuda_GpuMat(height, width, cv2.CV_8UC1),
-                'gpu_background': cv2.cuda_GpuMat(height, width, cv2.CV_8UC1),
-                'gpu_mask': cv2.cuda_GpuMat(height, width, cv2.CV_8UC1),
-                'gpu_roi_gray': cv2.cuda_GpuMat(height, width, cv2.CV_8UC1),
-                'gpu_roi_background': cv2.cuda_GpuMat(height, width, cv2.CV_8UC1),
-                'gpu_diff': cv2.cuda_GpuMat(height, width, cv2.CV_8UC1),
-                'gpu_thresh': cv2.cuda_GpuMat(height, width, cv2.CV_8UC1),
-                'gpu_dilated': cv2.cuda_GpuMat(height, width, cv2.CV_8UC1),
-                'kernel': cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                'background_gpu': None,
+                'gray_gpu': cv2.cuda_GpuMat(),
+                'fg_mask_gpu': cv2.cuda_GpuMat(),
+                'mog2': cv2.cuda.createBackgroundSubtractorMOG2()
             }
             return True, gpu_objects
         except Exception as e:
             print(f"GPU initialization failed: {e}")
-            return False, {}
+            return False, None
     
-    def process_cuda_motion(self, frame, rois, gpu_objects, background_set, camera_name):
+    def process_cuda_motion(self, frame, rois, gpu_objects, background_set, camera_name, yolo_detections=None):
+        """Process motion detection using CUDA with optional YOLO filtering"""
         try:
-            gpu_objects['gpu_frame'].upload(frame)
-            cv2.cuda.cvtColor(gpu_objects['gpu_frame'], gpu_objects['gpu_gray'], cv2.COLOR_BGR2GRAY)
+            if gpu_objects is None:
+                return background_set, []
+                
+            frame_gpu = cv2.cuda_GpuMat()
+            frame_gpu.upload(frame)
             
-            if not background_set:
-                gpu_objects['gpu_gray'].copyTo(gpu_objects['gpu_background'])
-                return True, []
+            # Convert to grayscale
+            gray_gpu = cv2.cuda.cvtColor(frame_gpu, cv2.COLOR_BGR2GRAY)
             
-            detections = []
+            # Apply background subtraction
+            fg_mask_gpu = gpu_objects['mog2'].apply(gray_gpu, -1)
+            
+            # Download mask from GPU
+            fg_mask = fg_mask_gpu.download()
+            
+            # Threshold
+            _, thresh = cv2.threshold(fg_mask, 25, 255, cv2.THRESH_BINARY)
+            
+            # Dilate
+            kernel = np.ones((5, 5), np.uint8)
+            dilated = cv2.dilate(thresh, kernel, iterations=2)
+            
+            # Find contours
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            motion_detections = []
             for roi in rois:
-                detection = self._process_roi_cuda(frame, roi, gpu_objects, camera_name)
-                if detection:
-                    detections.extend(detection)
-                    
-            return background_set, detections
+                roi_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+                cv2.fillPoly(roi_mask, [np.array(roi.points, dtype=np.int32)], 255)
+                
+                valid_motion_detected = False
+                
+                for contour in contours:
+                    if cv2.contourArea(contour) > self.motion_threshold:
+                        x, y, w, h = cv2.boundingRect(contour)
+                        contour_center = (x + w // 2, y + h // 2)
+                        
+                        if cv2.pointPolygonTest(np.array(roi.points, dtype=np.int32), contour_center, False) >= 0:
+                            # Check if motion corresponds to YOLO detection
+                            if yolo_detections:
+                                if self._motion_has_yolo_object(x, y, w, h, yolo_detections, roi):
+                                    valid_motion_detected = True
+                                    motion_detections.append({
+                                        'roi': roi,
+                                        'bbox': (x, y, w, h),
+                                        'contour': contour,
+                                        'has_object': True
+                                    })
+                            else:
+                                # If no YOLO detections provided, accept all motion
+                                valid_motion_detected = True
+                                motion_detections.append({
+                                    'roi': roi,
+                                    'bbox': (x, y, w, h),
+                                    'contour': contour,
+                                    'has_object': False
+                                })
+                
+                # Only trigger notification if valid motion detected
+                if valid_motion_detected:
+                    self._handle_motion_event(frame, roi, camera_name)
+            
+            background_set = True
+            return background_set, motion_detections
+            
         except Exception as e:
-            print(f"CUDA motion processing error: {e}")
+            print(f"CUDA motion detection error: {e}")
             return background_set, []
     
-    def _process_roi_cuda(self, frame, roi, gpu_objects, camera_name):
+    def process_cpu_motion(self, frame, background_frame, threshold_value=50):
+        """Process motion detection on CPU"""
         try:
-            pts = np.array(roi.points, dtype=np.int32)
-            cv2.polylines(frame, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
-            
-            mask = np.zeros((720, 1280), dtype=np.uint8)
-            cv2.fillPoly(mask, [pts], 255)
-            gpu_objects['gpu_mask'].upload(mask)
-            
-            cv2.cuda.bitwise_and(gpu_objects['gpu_gray'], gpu_objects['gpu_mask'], gpu_objects['gpu_roi_gray'])
-            cv2.cuda.bitwise_and(gpu_objects['gpu_background'], gpu_objects['gpu_mask'], gpu_objects['gpu_roi_background'])
-            cv2.cuda.absdiff(gpu_objects['gpu_roi_background'], gpu_objects['gpu_roi_gray'], gpu_objects['gpu_diff'])
-            cv2.cuda.threshold(gpu_objects['gpu_diff'], gpu_objects['gpu_thresh'], 50, 255, cv2.THRESH_BINARY)
-            cv2.cuda.dilate(gpu_objects['gpu_thresh'], gpu_objects['gpu_dilated'], gpu_objects['kernel'], iterations=2)
-            
-            dilated_image = gpu_objects['gpu_dilated'].download()
-            
-            return self._find_contours(dilated_image, roi.name, frame, camera_name)
-        except Exception as e:
-            print(f"CUDA ROI processing error: {e}")
-            return []
-    
-    def process_cpu_motion(self, frame, rois, background_frame, camera_name):
-        try:
-            if self.use_opencl:
-                gray_frame = cv2.cvtColor(cv2.UMat(frame), cv2.COLOR_BGR2GRAY).get()
-            else:
-                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                
+            # Convert frame to grayscale
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
+            # Ensure background frame exists and matches current frame size
             if background_frame is None:
-                return gray_frame, []
+                return gray, []
             
-            detections = []
-            for roi in rois:
-                detection = self._process_roi_cpu(frame, roi, gray_frame, background_frame, camera_name)
-                if detection:
-                    detections.extend(detection)
-                    
-            return background_frame, detections
+            # Convert background to grayscale if it's not already
+            if len(background_frame.shape) == 3:
+                bg_gray = cv2.cvtColor(background_frame, cv2.COLOR_BGR2GRAY)
+            else:
+                bg_gray = background_frame
+            
+            # Fix: Ensure both frames have the same size
+            if gray.shape != bg_gray.shape:
+                print(f"Frame size mismatch: current={gray.shape}, background={bg_gray.shape}")
+                # Resize background to match current frame
+                bg_gray = cv2.resize(bg_gray, (gray.shape[1], gray.shape[0]))
+                print(f"Resized background to: {bg_gray.shape}")
+            
+            # Calculate frame difference
+            frame_delta = cv2.absdiff(bg_gray, gray)
+            
+            # Apply threshold
+            thresh = cv2.threshold(frame_delta, threshold_value, 255, cv2.THRESH_BINARY)[1]
+            
+            # Find contours
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            motion_detections = []
+            for contour in contours:
+                if cv2.contourArea(contour) > self.motion_threshold:  # Filter small movements
+                    x, y, w, h = cv2.boundingRect(contour)
+                    # FIXED: Return dictionary format to match expected format
+                    motion_detections.append({
+                        'bbox': (x, y, w, h),
+                        'contour': contour,
+                        'has_object': False  # CPU detection doesn't have YOLO info
+                    })
+            
+            return gray, motion_detections
+            
         except Exception as e:
-            print(f"CPU motion processing error: {e}")
-            return background_frame, []
-    
-    def _process_roi_cpu(self, frame, roi, gray_frame, background_frame, camera_name):
-        try:
-            pts = np.array(roi.points, dtype=np.int32)
-            cv2.polylines(frame, [pts], isClosed=True, color=(255, 0, 0), thickness=2)
-            
-            mask = np.zeros_like(gray_frame)
-            cv2.fillPoly(mask, [pts], 255)
-            
-            roi_gray = cv2.bitwise_and(gray_frame, mask)
-            roi_background = cv2.bitwise_and(background_frame, mask)
-            diff, thresh = self.subtract_images(roi_background, roi_gray)
-            
-            if thresh is None or thresh.size == 0:
-                return []
-                
-            dilated_image = cv2.dilate(thresh, None, iterations=2)
-            return self._find_contours(dilated_image, roi.name, frame, camera_name)
-        except Exception as e:
-            print(f"CPU ROI processing error: {e}")
-            return []
-    
-    def _find_contours(self, dilated_image, roi_name, frame, camera_name, min_area=3000):
-        if dilated_image is None or dilated_image.size == 0:
-            return []
-            
-        try:
-            cnts = cv2.findContours(dilated_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cnts = imutils.grab_contours(cnts)
-            
-            detections = []
-            motion_detected = False
-            for c in cnts:
-                if cv2.contourArea(c) < min_area:
-                    continue
-                x, y, w, h = cv2.boundingRect(c)
-                detections.append({
+            print(f"Error in motion detection: {e}")
+            # Return safe defaults
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            return gray, []
+
+    def filter_detections_by_roi_and_yolo(self, motion_detections, rois, camera_name, yolo_detections=None):
+        """Filter motion detections by ROI and optionally by YOLO"""
+        filtered_detections = []
+        
+        for detection in motion_detections:
+            # FIXED: Handle both tuple and dict formats
+            if isinstance(detection, tuple):
+                x, y, w, h = detection
+                detection_dict = {
                     'bbox': (x, y, w, h),
-                    'roi_name': roi_name
-                })
-                motion_detected = True 
-
-            if motion_detected:
-                self._handle_motion_detection_with_consistency(frame, roi_name, camera_name)
-            else:
-                roi_key = f"{camera_name}_{roi_name}"
-                if roi_key in self.roi_motion_start_times:
-                    del self.roi_motion_start_times[roi_key]
-                    
-            return detections
-        except Exception as e:
-            print(f"Contour detection error: {e}")
-            return []
-
-    def _handle_motion_detection_with_consistency(self, frame, roi_name, camera_name):
-        """Enhanced motion detection with 1-second consistency rule"""
-        current_time = time.time()
-        roi_key = f"{camera_name}_{roi_name}"
-        
-        # Track motion start time
-        if roi_key not in self.roi_motion_start_times:
-            self.roi_motion_start_times[roi_key] = current_time
-        
-        # Calculate motion duration
-        motion_duration = current_time - self.roi_motion_start_times[roi_key]
-        
-        # Only proceed if motion is consistent for 1 second
-        if motion_duration >= self.motion_consistency_duration:
-            self.last_detection_time[roi_key] = current_time
-            
-            # Handle screenshot with cooldown
-            if self.save_screenshots:
-                self._save_screenshot_with_cooldown(frame, roi_name, camera_name, current_time)
-            
-            # Handle video recording
-            if self.save_videos:
-                self._handle_video_recording(frame, roi_name, camera_name, roi_key)
-
-    def _save_screenshot_with_cooldown(self, frame, roi_name, camera_name, current_time):
-        """Save screenshot with cooldown check"""
-        roi_key = f"{camera_name}_{roi_name}"
-        last_screenshot = self.roi_last_screenshot_time.get(roi_key, 0)
-        
-        if current_time - last_screenshot >= self.screenshot_cooldown:
-            self._save_screenshot(frame, roi_name, camera_name)
-            self.roi_last_screenshot_time[roi_key] = current_time
-
-    def _save_screenshot(self, frame, roi_name, camera_name):
-        try:
-            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-            filename = f"{camera_name}_{roi_name}_{timestamp}.jpg"
-            filepath = os.path.join(self.screenshot_dir, filename)
-
-            annotated_frame = frame.copy()
-            cv2.putText(annotated_frame, f"Motion in {roi_name}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            cv2.putText(annotated_frame, timestamp, (10, 70), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            cv2.imwrite(filepath, annotated_frame)
-            print(f"Screenshot saved: {filepath}")
-        except Exception as e:
-            print(f"Screenshot save error: {e}")
-
-    def _handle_video_recording(self, frame, roi_name, camera_name, roi_key):
-        try:
-            if roi_key not in self.active_recordings:
-                self._start_video_recording(roi_key, roi_name, camera_name, frame.shape)
-
-            if roi_key in self.active_recordings:
-                recording_info = self.active_recordings[roi_key]
-                video_writer = recording_info['writer']
-                
-                annotated_frame = frame.copy()
-                cv2.putText(annotated_frame, f"Recording: {roi_name}", (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                timestamp = datetime.datetime.now().strftime('%H:%M:%S')
-                cv2.putText(annotated_frame, timestamp, (10, 70), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                video_writer.write(annotated_frame)
-
-                if roi_key in self.recording_timers:
-                    self.recording_timers[roi_key].cancel()
-
-                self.recording_timers[roi_key] = threading.Timer(
-                    self.video_duration, 
-                    self._stop_video_recording, 
-                    args=[roi_key]
-                )
-                self.recording_timers[roi_key].start()
-        except Exception as e:
-            print(f"Video recording error: {e}")
-
-    def _start_video_recording(self, roi_key, roi_name, camera_name, frame_shape):
-        """Enhanced video recording with WhatsApp-compatible format"""
-        try:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # Create temporary raw video first
-            temp_filename = f"{camera_name}_{roi_name}_{timestamp}_temp.avi"
-            temp_filepath = os.path.join(self.temp_video_dir, temp_filename)
-            
-            # Final WhatsApp-compatible video
-            final_filename = f"{camera_name}_{roi_name}_{timestamp}.mp4"
-            final_filepath = os.path.join(self.video_path, final_filename)
-
-            # Use MJPEG for temporary recording (faster)
-            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            height, width = frame_shape[:2]
-            fps = 25.0
-
-            video_writer = cv2.VideoWriter(temp_filepath, fourcc, fps, (width, height))
-
-            if video_writer.isOpened():
-                self.active_recordings[roi_key] = {
-                    'writer': video_writer,
-                    'temp_path': temp_filepath,
-                    'final_path': final_filepath,
-                    'start_time': time.time()
+                    'has_object': False
                 }
-                print(f"Started recording video for {roi_key} at {temp_filepath}")
             else:
-                print(f"Failed to start video recording for {roi_key}")
-        except Exception as e:
-            print(f"Video start error: {e}")
-
-    def _stop_video_recording(self, roi_key):
-        """Enhanced stop recording with H.264 conversion for WhatsApp"""
-        try:
-            if roi_key in self.active_recordings:
-                recording_info = self.active_recordings[roi_key]
-                video_writer = recording_info['writer']
-                temp_path = recording_info['temp_path']
-                final_path = recording_info['final_path']
-                
-                # Release the video writer
-                video_writer.release()
-                del self.active_recordings[roi_key]
-                
-                print(f"Stopped recording for {roi_key}, converting to H.264...")
-                
-                # Convert to WhatsApp-compatible format in background
-                threading.Thread(
-                    target=self._convert_video_for_whatsapp,
-                    args=(temp_path, final_path, roi_key),
-                    daemon=True
-                ).start()
-                
-            if roi_key in self.recording_timers:
-                del self.recording_timers[roi_key]
-        except Exception as e:
-            print(f"Video stop error: {e}")
-
-    def _convert_video_for_whatsapp(self, temp_path, final_path, roi_key):
-        """Convert video to WhatsApp-compatible H.264 format"""
-        try:
-            # FFmpeg command for WhatsApp-compatible video
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', temp_path,
-                '-c:v', 'libx264',          # H.264 codec
-                '-preset', 'fast',          # Fast encoding
-                '-crf', '23',               # Good quality
-                '-profile:v', 'baseline',   # Baseline profile for compatibility
-                '-level', '3.0',            # Level 3.0 for compatibility
-                '-pix_fmt', 'yuv420p',      # Pixel format for compatibility
-                '-movflags', '+faststart',  # Optimize for streaming
-                '-max_muxing_queue_size', '1024',  # Handle encoding buffer
-                final_path
-            ]
+                detection_dict = detection
+                x, y, w, h = detection_dict['bbox']
             
-            # Run FFmpeg conversion
-            result = subprocess.run(
-                cmd, 
-                capture_output=True, 
-                text=True, 
-                timeout=60  # 60 second timeout
-            )
+            center_x, center_y = x + w//2, y + h//2
             
-            if result.returncode == 0:
-                print(f"Video converted successfully: {final_path}")
-                
-                # Clean up temporary file
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
-                
-                # Verify file size (WhatsApp limit: 16MB)
-                file_size = os.path.getsize(final_path)
-                if file_size > 16 * 1024 * 1024:  # 16MB
-                    print(f"Warning: Video file too large for WhatsApp: {file_size / (1024*1024):.2f}MB")
-                    # Try to compress further
-                    self._compress_video_further(final_path, roi_key)
-                else:
-                    # Send WhatsApp notification
-                    if self.whatsapp_enabled and self.whatsapp:
-                        self._send_whatsapp_notification_for_file(final_path, roi_key)
-            else:
-                print(f"FFmpeg conversion failed: {result.stderr}")
-                # Clean up temp file
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
-                
-        except subprocess.TimeoutExpired:
-            print(f"Video conversion timeout for {roi_key}")
-        except Exception as e:
-            print(f"Error converting video for {roi_key}: {e}")
-
-    def _compress_video_further(self, video_path, roi_key):
-        """Further compress video if it's too large for WhatsApp"""
-        try:
-            compressed_path = video_path.replace('.mp4', '_compressed.mp4')
+            # Check if detection is within any ROI
+            in_roi = False
+            roi_name = None
             
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', video_path,
-                '-c:v', 'libx264',
-                '-preset', 'fast',
-                '-crf', '28',               # Higher CRF for more compression
-                '-profile:v', 'baseline',
-                '-level', '3.0',
-                '-pix_fmt', 'yuv420p',
-                '-vf', 'scale=640:480',     # Reduce resolution
-                '-r', '15',                 # Reduce framerate
-                '-movflags', '+faststart',
-                '-max_muxing_queue_size', '1024',
-                compressed_path
-            ]
+            for roi in rois:
+                if self._point_in_polygon((center_x, center_y), roi.points):
+                    in_roi = True
+                    roi_name = roi.name
+                    break
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            
-            if result.returncode == 0:
-                # Replace original with compressed version
-                os.remove(video_path)
-                os.rename(compressed_path, video_path)
-                print(f"Video compressed successfully: {video_path}")
-                
-                # Send WhatsApp notification
-                if self.whatsapp_enabled and self.whatsapp:
-                    self._send_whatsapp_notification_for_file(video_path, roi_key)
-            else:
-                print(f"Video compression failed: {result.stderr}")
-                
-        except Exception as e:
-            print(f"Error compressing video: {e}")
-
-    def _send_whatsapp_notification_for_file(self, video_path, roi_key):
-        """Send WhatsApp notification for a specific video file"""
-        try:
-            current_time = time.time()
-            last_whatsapp = self.roi_last_whatsapp_time.get(roi_key, 0)
-            
-            # Check cooldown
-            if current_time - last_whatsapp < self.whatsapp_cooldown:
-                print(f"WhatsApp cooldown active for {roi_key}. Waiting {self.whatsapp_cooldown - (current_time - last_whatsapp):.1f} seconds")
-                return
-            
-            camera_name, roi_name = roi_key.split('_', 1)
-            
-            def send_notification():
-                try:
-                    result = self.whatsapp.send_video_notification(
-                        self.recipient_number,
-                        video_path,
-                        camera_name,
-                        roi_name
-                    )
-                    if result:
-                        print(f"WhatsApp notification sent for {roi_key}")
-                        self.roi_last_whatsapp_time[roi_key] = current_time
-                    else:
-                        print(f"Failed to send WhatsApp notification for {roi_key}")
-                except Exception as e:
-                    print(f"Error sending WhatsApp notification: {e}")
-            
-            # Send in background thread
-            threading.Thread(target=send_notification, daemon=True).start()
-            
-        except Exception as e:
-            print(f"Error preparing WhatsApp notification for {roi_key}: {e}")
-
-    def _send_whatsapp_notification(self, roi_key):
-        """Legacy method - finds most recent video and sends"""
-        try:
-            current_time = time.time()
-            last_whatsapp_time = self.roi_last_whatsapp_time.get(roi_key, 0)
-            
-            if current_time - last_whatsapp_time < self.whatsapp_cooldown:
-                print(f"WhatsApp cooldown active for {roi_key}")
-                return
-            
-            camera_name, roi_name = roi_key.split('_', 1)
-            video_files = []
-
-            for filename in os.listdir(self.video_path):
-                if filename.startswith(f"{camera_name}_{roi_name}_") and filename.endswith('.mp4'):
-                    filepath = os.path.join(self.video_path, filename)
-                    video_files.append((filepath, os.path.getmtime(filepath)))
+            if in_roi:
+                # If YOLO filtering is enabled, check for person/vehicle overlap
+                if yolo_detections:
+                    yolo_overlap = False
+                    for yolo_det in yolo_detections:
+                        yolo_x, yolo_y, yolo_w, yolo_h = yolo_det['bbox']
+                        # Check for overlap
+                        if (x < yolo_x + yolo_w and x + w > yolo_x and 
+                            y < yolo_y + yolo_h and y + h > yolo_y):
+                            yolo_overlap = True
+                            break
                     
-            if video_files:
-                most_recent_video = max(video_files, key=lambda x: x[1])[0]
-                self._send_whatsapp_notification_for_file(most_recent_video, roi_key)
-            else:
-                print(f"No video files found for {roi_key}")
-                
-        except Exception as e:
-            print(f"Error in legacy WhatsApp notification: {e}")
+                    if yolo_overlap:
+                        filtered_detections.append(detection_dict)
+                        # Send notification
+                        self._send_motion_notification(camera_name, roi_name, detection_dict)
+                else:
+                    # No YOLO filtering, accept all ROI detections
+                    filtered_detections.append(detection_dict)
+                    # Send notification
+                    self._send_motion_notification(camera_name, roi_name, detection_dict)
+        
+        return filtered_detections
 
-    def write_frame_to_active_recordings(self, frame):
-        """Write frame to all active recordings"""
-        try:
-            for roi_key, recording_info in self.active_recordings.items():
-                if isinstance(recording_info, dict) and 'writer' in recording_info:
-                    video_writer = recording_info['writer']
-                    if video_writer.isOpened():
-                        video_writer.write(frame)
-                elif hasattr(recording_info, 'write'):  # Backward compatibility
-                    if recording_info.isOpened():
-                        recording_info.write(frame)
-        except Exception as e:
-            print(f"Error writing frame to recordings: {e}")
+    def _point_in_polygon(self, point, polygon_points):
+        """Check if point is inside polygon using ray casting algorithm"""
+        x, y = point
+        n = len(polygon_points)
+        inside = False
+        
+        p1x, p1y = polygon_points[0]
+        for i in range(1, n + 1):
+            p2x, p2y = polygon_points[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        
+        return inside
 
-    def cleanup_recordings(self):
-        """Enhanced cleanup including temp files"""
-        try:
-            for roi_key in list(self.active_recordings.keys()):
-                self._stop_video_recording(roi_key)
-            
-            for timer in self.recording_timers.values():
-                timer.cancel()
-            
-            self.recording_timers.clear()
-            
-            # Clean up temp video directory
+    def _send_motion_notification(self, camera_name, roi_name, detection):
+        """Send motion notification"""
+        if getattr(self, 'notifications_enabled', True):
             try:
-                for filename in os.listdir(self.temp_video_dir):
-                    if filename.endswith('_temp.avi'):
-                        os.remove(os.path.join(self.temp_video_dir, filename))
-            except:
-                pass
-        except Exception as e:
-            print(f"Error during cleanup: {e}")
-
-    def get_recording_status(self):
-        """Get current recording status"""
-        try:
-            return {
-                'active_recordings': len(self.active_recordings),
-                'recording_rois': list(self.active_recordings.keys()),
-                'whatsapp_enabled': self.whatsapp_enabled
-            }
-        except Exception as e:
-            print(f"Error getting recording status: {e}")
-            return {
-                'active_recordings': 0,
-                'recording_rois': [],
-                'whatsapp_enabled': False
-            }
-
-    # Legacy method for backward compatibility
-    def _handle_motion_detection(self, frame, roi_name, camera_name):
-        """Keep this for backward compatibility, but use the new method"""
-        self._handle_motion_detection_with_consistency(frame, roi_name, camera_name)
+                print(f"Motion detected in ROI: {roi_name} for camera {camera_name}")
+                # FIXED: Handle detection format
+                if isinstance(detection, dict):
+                    bbox = detection['bbox']
+                else:
+                    bbox = detection
+                    # Add your webhook notification code here
+            except Exception as e:
+                print(f"Error sending notification: {e}")
+    
+    def _motion_has_yolo_object(self, motion_x, motion_y, motion_w, motion_h, yolo_detections, roi):
+        """Check if motion area overlaps with any YOLO detected object in the ROI"""
+        motion_bbox = (motion_x, motion_y, motion_x + motion_w, motion_y + motion_h)
+        
+        for detection in yolo_detections:
+            yolo_bbox = detection['bbox']  # (x1, y1, x2, y2)
+            
+            # Check if YOLO detection center is in ROI
+            yolo_center_x = (yolo_bbox[0] + yolo_bbox[2]) // 2
+            yolo_center_y = (yolo_bbox[1] + yolo_bbox[3]) // 2
+            
+            if cv2.pointPolygonTest(np.array(roi.points, dtype=np.int32), 
+                                   (yolo_center_x, yolo_center_y), False) >= 0:
+                # Check if bounding boxes overlap
+                if self._boxes_overlap(motion_bbox, yolo_bbox):
+                    return True
+        
+        return False
+    
+    def _boxes_overlap(self, box1, box2, overlap_threshold=0.3):
+        """Check if two bounding boxes overlap"""
+        x1_min, y1_min, x1_max, y1_max = box1
+        x2_min, y2_min, x2_max, y2_max = box2
+        
+        # Calculate intersection
+        x_left = max(x1_min, x2_min)
+        y_top = max(y1_min, y2_min)
+        x_right = min(x1_max, x2_max)
+        y_bottom = min(y1_max, y2_max)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return False
+        
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+        
+        box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+        box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+        
+        # Calculate IoU
+        iou = intersection_area / float(box1_area + box2_area - intersection_area)
+        
+        return iou > overlap_threshold
+    
+    def _handle_motion_event(self, frame, roi, camera_name):
+        """Handle motion detection event with cooldown"""
+        recording_key = f"{camera_name}_{roi.name}"
+        current_time = time.time()
+        
+        # Check cooldown for notifications
+        roi_key = f"{camera_name}_{roi.name}"
+        last_notif_time = self.last_notification_time.get(roi_key, 0)
+        
+        with self.recording_lock:
+            if recording_key not in self.active_recordings:
+                # Start new recording
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                screenshot_path = self.screenshots_dir / f"{camera_name}_{roi.name}_{timestamp}.jpg"
+                temp_video_path = self.temp_videos_dir / f"{camera_name}_{roi.name}_{timestamp}.avi"
+                
+                # Save screenshot
+                cv2.imwrite(str(screenshot_path), frame)
+                
+                # Initialize video writer
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                out = cv2.VideoWriter(str(temp_video_path), fourcc, 20.0, (frame.shape[1], frame.shape[0]))
+                
+                self.active_recordings[recording_key] = {
+                    'out': out,
+                    'start_time': current_time,
+                    'last_motion': current_time,
+                    'temp_path': temp_video_path,
+                    'screenshot_path': screenshot_path,
+                    'notified': False
+                }
+                
+                print(f"Started recording for {camera_name}/{roi.name}")
+            else:
+                # Update existing recording
+                recording = self.active_recordings[recording_key]
+                recording['last_motion'] = current_time
+                recording['out'].write(frame)
+                
+                # CHANGED: Check notifications_enabled flag
+                should_notify = (
+                    self.notifications_enabled and  # NEW: Check if notifications are enabled
+                    not recording['notified'] and 
+                    (current_time - recording['start_time']) > 2 and
+                    (current_time - last_notif_time) > self.notification_cooldown
+                )
+                
+                if should_notify:
+                    self.notifier.send_notification(
+                        camera_name=camera_name,
+                        roi_name=roi.name,
+                        screenshot_path=str(recording['screenshot_path']),
+                        metadata={
+                            'recording_duration': current_time - recording['start_time']
+                        }
+                    )
+                    recording['notified'] = True
+                    self.last_notification_time[roi_key] = current_time
+                    print(f"Notification sent for {camera_name}/{roi.name}")
+    
+    def cleanup_recordings(self):
+        """Cleanup and finalize recordings that haven't seen motion for 5 seconds"""
+        current_time = time.time()
+        
+        with self.recording_lock:
+            keys_to_remove = []
+            
+            for key, recording in self.active_recordings.items():
+                if current_time - recording['last_motion'] > 5:
+                    # Finalize recording
+                    recording['out'].release()
+                    
+                    # Move to final location
+                    final_path = self.videos_dir / recording['temp_path'].name
+                    recording['temp_path'].rename(final_path)
+                    
+                    print(f"Finalized recording: {final_path}")
+                    keys_to_remove.append(key)
+            
+            for key in keys_to_remove:
+                del self.active_recordings[key]

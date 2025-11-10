@@ -1,4 +1,8 @@
 import sqlite3
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 corner_threshold = 100
 snap_distance = 50
@@ -8,8 +12,7 @@ class ROI:
     def __init__(self, name, points, roi_id=None):
         self.name = name
         self.points = points
-        self.id = roi_id  # Store ROI ID for database reference
-
+        self.id = roi_id 
     def to_init(self):
         return {'id': self.id, 'name': self.name, 'points': self.points}
 
@@ -38,21 +41,41 @@ class Camera:
             'camera_id': self.camera_id,
             'rois': [roi.to_init() for roi in self.rois]
         }
+corner_threshold = 100
+snap_distance = 50
+server_ip = 'localhost'
+
+# NEW: Motion detection configuration
+MOTION_CONFIG = {
+    'min_contour_area': 500,  # Minimum area to consider as motion
+    'notification_cooldown': 30,  # Seconds between notifications
+    'use_yolo_filtering': False,  
+    'yolo_filter_classes': [0, 1, 2, 3, 5, 7],  
+    'overlap_threshold': 0.3  #
+}
+
 
 videos = [Camera(
-    rtsp_link="rtsp://admin:c0smeti123@10.10.10.98:554/cam/realmonitor?channel=6&subtype=0&unicast=true&proto=Onvif",
+    rtsp_link="rtsp://Operator:SmartBox80!@bkdavid.ddns.net:554/streaming/channels/302/",
     camera_name="sample1",
     camera_id="1",
     rois=[]
 ),
 ]
-
+ 
 videos_dict = [cam.to_dict() for cam in videos]
 
+# Webhook Configuration (replaces WhatsApp)
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')
+WEBHOOK_API_KEY = os.getenv('WEBHOOK_API_KEY')  # Optional, for authentication
+WEBHOOK_TIMEOUT = int(os.getenv('WEBHOOK_TIMEOUT', '10'))
 
-WHATSAPP_CONFIG = {
-    'enabled': True,
-    'access_token': 'EAAJ1Mph6nNkBPCvBOZB5taEYzbSt0nQbCp69ctAAstMXXXroxZAJwWsIaBTUXtnwrJcpFDT7ONkKJ6gqxUHLPYVVP5iFk9SsZAQscbOxF8wPtvZATn3TYtCpei388XvB5jd44BZAyd8NMe8ulyDtaLUX4S44J3qnlAfriGXa9TRgtqRUhfDNnzr2EZAed97wZDZD',
-    'phone_number_id': '635876812952923',
-    'recipient_number': '639763583028'
+NOTIFICATION_CONFIG = {
+    'enabled': os.getenv('NOTIFICATION_ENABLED', 'True').lower() == 'true',
+    'service': 'webhook',
+    'webhook_url': WEBHOOK_URL,
+    'api_key': WEBHOOK_API_KEY,
+    'timeout': WEBHOOK_TIMEOUT,
+    'retry_attempts': 3,
+    'retry_delay': 2  # seconds
 }

@@ -1,16 +1,18 @@
 {
   "name": "cctv-javascript-interface",
   "version": "1.0.0",
-  "description": "JavaScript interface for CCTV Python system",
+  "description": "JavaScript interface for CCTV control system",
   "main": "cctvController.js",
+  "type": "module",
   "scripts": {
     "test": "node test.js",
-    "start": "node server.js"
+    "start": "node test.js"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "socket.io-client": "^4.7.2",
+    "node-fetch": "^3.3.2"
   },
-  "keywords": ["cctv", "motion-detection", "security"],
-  "author": "Your Name",
+  "keywords": ["cctv", "motion-detection", "websocket"],
+  "author": "",
   "license": "MIT"
 }
