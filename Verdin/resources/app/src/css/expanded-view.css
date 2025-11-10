@@ -1,0 +1,87 @@
+.expanded-video-view {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: row;
+}
+
+.expanded-video-view > .expanded-video-content {
+    flex: auto;
+    display: flex;
+    flex-direction: column;
+}
+
+.expanded-video-view > .expanded-video-content .view-area {
+    flex: auto;
+}
+
+.expanded-video-view > .expanded-video-content .view-area > video {
+    height: 100%;
+    aspect-ratio: 16/9;
+    width: 100%;
+    object-fit: contain;
+    object-position: center;
+    background-color: #000;
+}
+
+.expanded-video-view > .expanded-video-content .basic-controls {
+    min-height: 60px;
+    padding: 0 1rem;
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.expanded-video-view > .expanded-video-content .basic-controls .status-area .connected,
+.expanded-video-view > .expanded-video-content .basic-controls .status-area .disconnected {
+    font-size: small;
+}
+
+.expanded-video-view > .expanded-video-content .basic-controls .status-area .connected,
+.expanded-video-view > .expanded-video-content .basic-controls .status-area .connected * {
+    color: aquamarine;
+}
+
+.expanded-video-view > .expanded-video-content .basic-controls .status-area .disconnected,
+.expanded-video-view > .expanded-video-content .basic-controls .status-area .disconnected * {
+    color: #e00;
+}
+
+/* Actions area styling for expanded video view */
+.expanded-video-view > .expanded-video-content .basic-controls .actions-area {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.expanded-video-view > .expanded-video-content .basic-controls .actions-area a {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 6px;
+    background-color: rgba(255, 255, 255, 0.1);
+    color: #fff;
+    text-decoration: none;
+    transition: all 0.2s ease;
+    cursor: pointer;
+    font-size: 1.1em;
+}
+
+.expanded-video-view > .expanded-video-content .basic-controls .actions-area a:hover {
+    background-color: rgba(0, 119, 255, 0.2);
+    color: #0077ff;
+    transform: scale(1.05);
+}
+
+.expanded-video-view > .expanded-video-content .basic-controls .actions-area a:active {
+    transform: scale(0.95);
+}
+
+.expanded-video-view > .video-control-panel {
+    min-width: 250px;
+    padding: 0.5rem;
+    background-color: #222;
+}
